@@ -5934,10 +5934,10 @@ class SlackAdapter(BasePlatformAdapter):
                 att_footer = att.get("footer", "")
                 att_fallback = att.get("fallback", "")
 
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
+                # ``is_msg_unfurl`` is also Slack's shape for a user-forwarded
+                # channel message.  Do not drop it: own bot messages were
+                # already filtered above, while a human-authored share may carry
+                # the entire forwarded request only in this attachment.
 
                 # Build a readable representation.
                 if att_title and att_url:
@@ -9486,21 +9486,21 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
-    """Translate ``config.yaml`` ``slack:`` keys into ``SLACK_*`` env vars.
+    """Translate ``config.yaml`` ``slack:`` keys into runtime settings.
 
     Implements the ``apply_yaml_config_fn`` contract (#24849). Mirrors the
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    Most SlackAdapter call sites still read ``os.getenv()``, so this hook keeps
+    the existing YAML→env bridge. ``allow_bots`` is also returned in
+    ``PlatformConfig.extra`` because gateway authorization must resolve that
+    policy from the selected profile's adapter without borrowing another
+    profile's process-global environment under multiplexing. The explicit
+    per-profile config value is authoritative when present; the env bridge
+    remains for legacy adapter call sites and config-absent installations.
     """
+    extras: dict = {}
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
     if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
@@ -9515,8 +9515,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_THREAD_REQUIRE_MENTION"] = str(
             slack_cfg["thread_require_mention"]
         ).lower()
-    if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
-        os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+    if "allow_bots" in slack_cfg:
+        allow_bots = str(slack_cfg["allow_bots"]).lower()
+        extras["allow_bots"] = allow_bots
+        if not os.getenv("SLACK_ALLOW_BOTS"):
+            os.environ["SLACK_ALLOW_BOTS"] = allow_bots
     frc = slack_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
@@ -9551,7 +9554,7 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    return extras or None
 
 
 def _is_connected(config) -> bool:

@@ -506,11 +506,55 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            allow_bots_mode = (
+                _platform_gate_env(allow_bots_var, "none").lower().strip()
+                if allow_bots_var
+                else "none"
+            )
+            # Slack's canonical config path is ``slack.allow_bots``. The
+            # adapter resolves that value, but the final gateway auth gate used
+            # to consult only ``SLACK_ALLOW_BOTS``; config-only Workflow Builder
+            # posts therefore reached this point with user_id=None and were
+            # rejected below. Read only the selected adapter's explicit config
+            # value here, and let it override env when present (matching Slack's
+            # documented config precedence). Do not call ``_slack_allow_bots()``:
+            # its environment fallback can borrow another profile's
+            # process-global value under multiplexing after
+            # ``_platform_gate_env`` correctly failed closed.
+            if source.platform == Platform.SLACK:
+                adapter = self._adapter_for_source(source)
+                adapter_config = getattr(adapter, "config", None)
+                adapter_extra = getattr(adapter_config, "extra", None)
+                if isinstance(adapter_extra, dict) and "allow_bots" in adapter_extra:
+                    allow_bots_mode = str(
+                        adapter_extra.get("allow_bots", "none")
+                    ).lower().strip()
+            if allow_bots_mode in {"mentions", "all"}:
                 return True
 
         if not user_id:
             return False
+
+        # Slack can be shared safely at channel scope without opening the bot's
+        # 1:1 DMs to every workspace member. The Slack adapter applies the same
+        # SLACK_ALLOWED_CHANNELS gate before dispatch; mirror that explicit
+        # operator allowlist here for human channel messages. DMs/MPIMs keep
+        # using SLACK_ALLOWED_USERS or pairing, and bot senders still use the
+        # dedicated SLACK_ALLOW_BOTS gate above.
+        if (
+            source.platform == Platform.SLACK
+            and source.chat_type in {"group", "forum", "channel"}
+            and source.chat_id
+            and not getattr(source, "is_bot", False)
+        ):
+            raw_slack_channels = _platform_gate_env("SLACK_ALLOWED_CHANNELS")
+            allowed_slack_channels = {
+                channel_id.strip()
+                for channel_id in raw_slack_channels.split(",")
+                if channel_id.strip()
+            }
+            if "*" in allowed_slack_channels or source.chat_id in allowed_slack_channels:
+                return True
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",

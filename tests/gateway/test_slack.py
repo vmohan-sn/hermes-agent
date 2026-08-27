@@ -207,6 +207,35 @@ def _redirect_cache(tmp_path, monkeypatch):
 class TestBotEventDiagnostics:
     """#30091 — surface upstream filters that drop bot events."""
 
+    def test_allow_bots_yaml_bridge_seeds_adapter_extra(self, monkeypatch):
+        """Profile config must survive without process-global env fallback."""
+        monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
+
+        extras = _slack_mod._apply_yaml_config({}, {"allow_bots": "all"})
+
+        assert extras == {"allow_bots": "all"}
+        assert os.environ["SLACK_ALLOW_BOTS"] == "all"
+
+    def test_top_level_allow_bots_loads_into_platform_extra(
+        self, monkeypatch, tmp_path
+    ):
+        """The deployed top-level slack block must reach the selected adapter."""
+        from gateway.config import load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  allow_bots: all\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SLACK_ALLOW_BOTS", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].extra["allow_bots"] == "all"
+        assert os.environ["SLACK_ALLOW_BOTS"] == "all"
+
     @pytest.mark.asyncio
     async def test_handler_emits_debug_for_bot_event(self, adapter, caplog):
         import logging
@@ -1738,6 +1767,31 @@ class TestIncomingDocumentHandling:
         assert "> Quoted line" in msg_event.text
         assert "• First bullet" in msg_event.text
         assert "• Second bullet" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_forwarded_message_unfurl_is_surfaced(self, adapter):
+        """Slack message-share attachments must reach the agent as forwarded text."""
+        forwarded = (
+            "Based on what is due in the next week and currently overdue, "
+            "what should Justin Woo and Vasanth Mohan focus on today?"
+        )
+        event = self._make_event(
+            text="Please fix so that it gets a response to this",
+            attachments=[
+                {
+                    "is_msg_unfurl": True,
+                    "title": "Forwarded from #marketing-jira",
+                    "text": forwarded,
+                    "fallback": forwarded,
+                }
+            ],
+        )
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "Please fix so that it gets a response to this" in msg_event.text
+        assert forwarded in msg_event.text
 
 
 # ---------------------------------------------------------------------------

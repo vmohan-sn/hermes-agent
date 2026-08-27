@@ -16,6 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.secret_scope import (
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
+from gateway.config import PlatformConfig
 from gateway.session import Platform, SessionSource
 
 
@@ -66,6 +72,56 @@ def test_slack_bot_authorized_when_allow_bots_all(monkeypatch):
     runner = _make_bare_runner()
     monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
     assert runner._is_user_authorized(_make_slack_bot_source()) is True
+
+
+def test_slack_bot_authorized_from_adapter_config_when_env_absent():
+    """Config-only allow_bots must authorize Workflow Builder posts."""
+    runner = _make_bare_runner()
+    runner.adapters = {
+        Platform.SLACK: SimpleNamespace(
+            config=PlatformConfig(enabled=True, extra={"allow_bots": "all"})
+        )
+    }
+
+    assert runner._is_user_authorized(_make_slack_bot_source()) is True
+
+
+def test_secondary_profile_does_not_borrow_global_allow_bots(monkeypatch):
+    """A multiplex profile with no bot policy must remain fail-closed."""
+    runner = _make_bare_runner()
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "jira-marketing": {
+            Platform.SLACK: SimpleNamespace(
+                config=PlatformConfig(enabled=True, extra={}),
+                _slack_allow_bots=lambda: "all",
+            )
+        }
+    }
+    source = _make_slack_bot_source()
+    source.profile = "jira-marketing"
+
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+    set_multiplex_active(True)
+    token = set_secret_scope({})
+    try:
+        assert runner._is_user_authorized(source) is False
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)
+
+
+def test_adapter_config_none_overrides_environment_all(monkeypatch):
+    """The selected Slack profile config is authoritative over global env."""
+    runner = _make_bare_runner()
+    runner.adapters = {
+        Platform.SLACK: SimpleNamespace(
+            config=PlatformConfig(enabled=True, extra={"allow_bots": "none"})
+        )
+    }
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+
+    assert runner._is_user_authorized(_make_slack_bot_source()) is False
 
 
 def test_slack_human_unaffected_by_bot_bypass(monkeypatch):
