@@ -17252,6 +17252,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if self._is_session_running(_quick_key):
+            def _priority_ingress_queued(accepted: bool) -> None:
+                if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                    event.metadata[
+                        "slack_ingress_deferred" if accepted else "slack_ingress_inline_failed"
+                    ] = True
+
+            def _priority_ingress_inline() -> None:
+                if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                    event.metadata["slack_ingress_inline_complete"] = True
+
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -17293,6 +17303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self._adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                _priority_ingress_queued(adapter is not None)
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -17324,6 +17335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event,
                             merge_text=True,
                         )
+                _priority_ingress_queued(adapter is not None)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -17345,13 +17357,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event,
                         merge_text=True,
                     )
+                _priority_ingress_queued(adapter is not None)
                 return None
             if self._draining:
                 queue_during_drain = self._queue_during_drain_enabled(
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    queue_during_drain = self._queue_or_replace_pending_event(_quick_key, event)
+                    _priority_ingress_queued(queue_during_drain)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if queue_during_drain
@@ -17359,7 +17373,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                _priority_ingress_queued(self._queue_or_replace_pending_event(_quick_key, event))
                 return None
             if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
@@ -17381,9 +17395,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         steered = False
                 if steered:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
+                    _priority_ingress_inline()
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                _priority_ingress_queued(self._queue_or_replace_pending_event(_quick_key, event))
                 return None
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
@@ -17399,7 +17414,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                _priority_ingress_queued(self._queue_or_replace_pending_event(_quick_key, event))
                 return None
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
@@ -17415,7 +17430,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
+                _priority_ingress_queued(self._queue_or_replace_pending_event(_quick_key, event))
                 return None
             # Text-only corrections redirect the live turn (preserving
             # displayed context) when the runtime supports it; media/voice and
@@ -17431,6 +17446,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     if running_agent.redirect((event.text or "").strip()):
                         logger.debug("PRIORITY redirect for session %s", _quick_key)
+                        _priority_ingress_inline()
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -17439,6 +17455,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc,
                     )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                _priority_ingress_queued(accepted)
+                if not accepted:
+                    return None
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
             if self._pending_event_audio_paths(event):

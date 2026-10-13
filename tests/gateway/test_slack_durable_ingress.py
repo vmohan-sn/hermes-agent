@@ -235,6 +235,34 @@ async def test_debounced_busy_messages_preserve_all_receipt_ids():
 
 
 @pytest.mark.asyncio
+async def test_priority_rejected_turn_is_not_marked_done_on_empty_response(tmp_path):
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")
+    adapter._ingress_journal.put(_payload("Ev-rejected"))
+    adapter._reactions_enabled = lambda: False
+    event = SimpleNamespace(metadata={"slack_ingress_receipt_ids": ["Ev-rejected"], "slack_ingress_inline_failed": True}, message_id="123.456")
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    with sqlite3.connect(adapter._ingress_journal.path) as db:
+        assert db.execute("SELECT done_at FROM receipts WHERE event_id='Ev-rejected'").fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_priority_queued_turn_stays_pending_until_its_own_completion(tmp_path):
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")
+    adapter._ingress_journal.put(_payload("Ev-queued"))
+    adapter._reactions_enabled = lambda: False
+    event = SimpleNamespace(metadata={"slack_ingress_receipt_ids": ["Ev-queued"], "slack_ingress_deferred": True}, message_id="123.456")
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    with sqlite3.connect(adapter._ingress_journal.path) as db:
+        assert db.execute("SELECT done_at FROM receipts WHERE event_id='Ev-queued'").fetchone()[0] is None
+    event.metadata.pop("slack_ingress_deferred")
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    with sqlite3.connect(adapter._ingress_journal.path) as db:
+        assert db.execute("SELECT done_at FROM receipts WHERE event_id='Ev-queued'").fetchone()[0] is not None
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancelled_turn_remains_replayable(tmp_path):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
     adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")

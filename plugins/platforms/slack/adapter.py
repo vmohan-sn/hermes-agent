@@ -4360,7 +4360,13 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
         receipt_ids = (event.metadata or {}).get("slack_ingress_receipt_ids") or []
+        if (event.metadata or {}).get("slack_ingress_deferred"):
+            # Runner's priority busy path queued this event while the first
+            # adapter turn returned. Its later queued turn owns completion.
+            return
         if receipt_ids and self._ingress_journal is not None:
+            if (event.metadata or {}).get("slack_ingress_inline_failed"):
+                outcome = ProcessingOutcome.FAILURE
             for receipt_id in receipt_ids:
                 try:
                     intentional_cancel = (

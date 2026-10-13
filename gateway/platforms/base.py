@@ -6324,6 +6324,11 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # A priority busy-handler can queue this same event while an earlier
+        # task exits. Only the queued task (not that earlier handoff) may
+        # finalize its durable Slack receipt.
+        if (event.metadata or {}).get("slack_ingress_deferred"):
+            event.metadata.pop("slack_ingress_deferred", None)
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False

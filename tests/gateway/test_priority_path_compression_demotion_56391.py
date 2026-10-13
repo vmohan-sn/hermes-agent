@@ -134,6 +134,32 @@ def _make_runner(*, compression_in_flight: bool):
 
 
 @pytest.mark.asyncio
+async def test_priority_queue_preserves_slack_receipt_until_followup_turn():
+    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner._busy_input_mode = "queue"
+    event = _make_event("still there?")
+    event.metadata["slack_ingress_receipt_ids"] = ["Ev-priority"]
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
+    await runner._handle_message(event)
+    runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
+    assert event.metadata["slack_ingress_deferred"] is True
+    agent_mock.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_priority_full_queue_requests_slack_receipt_retry():
+    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner._busy_input_mode = "queue"
+    event = _make_event("still there?")
+    event.metadata["slack_ingress_receipt_ids"] = ["Ev-priority-full"]
+    runner._queue_or_replace_pending_event = MagicMock(return_value=False)
+    await runner._handle_message(event)
+    assert event.metadata["slack_ingress_inline_failed"] is True
+    assert not event.metadata.get("slack_ingress_deferred")
+    agent_mock.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_priority_path_does_not_interrupt_when_compression_in_flight():
     """A plain-text follow-up must NOT interrupt the running agent while
     context compression is in flight — it must queue instead, mirroring
