@@ -10076,10 +10076,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10120,7 +10120,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -10128,9 +10128,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -10176,6 +10177,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
         if not self._is_user_authorized(event.source):
+            if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                event.metadata["slack_ingress_inline_complete"] = True
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -10192,17 +10195,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._draining:
             adapter = self._adapter_for_source(event.source)
             if not adapter:
+                if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                    event.metadata["slack_ingress_inline_failed"] = True
                 return True
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
+            queued_for_recovery = self._queue_during_drain_enabled(effective_mode)
+            if queued_for_recovery:
+                queued_for_recovery = self._queue_or_replace_pending_event(session_key, event)
+                if not queued_for_recovery and (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                    event.metadata["slack_ingress_inline_failed"] = True
+            if queued_for_recovery:
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
-            await adapter._send_with_retry(
+            delivery = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -10214,6 +10223,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
+            if not queued_for_recovery and (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                event.metadata[
+                    "slack_ingress_inline_complete" if delivery.success else "slack_ingress_inline_failed"
+                ] = True
             return True
 
         # --- Approval response routing (#46866) ---
@@ -10273,16 +10286,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key, _verb, _normalized_args,
                     )
                     _adapter = self._adapter_for_source(event.source)
+                    if _reply and not _adapter and (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                        event.metadata["slack_ingress_inline_failed"] = True
+                        return True
                     if _adapter and _reply:
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
                             _anchor = self._reply_anchor_for_event(event)
-                            await _adapter._send_with_retry(
+                            delivered = await _adapter._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_anchor,
                                 metadata=self._thread_metadata_for_source(event.source, _anchor),
                             )
+                            if not delivered.success and (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                                event.metadata["slack_ingress_inline_failed"] = True
+                                return True
+                    if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                        event.metadata["slack_ingress_inline_complete"] = True
                     return True
         except Exception:
             logger.warning(
@@ -10425,7 +10446,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
         if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            if not self._queue_or_replace_pending_event(session_key, event):
+                if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                    event.metadata["slack_ingress_inline_failed"] = True
+                return True
+        elif (event.metadata or {}).get("slack_ingress_receipt_ids"):
+            # Steer/redirect was injected directly into the active turn. No
+            # follow-up processing hook will fire for this separate message.
+            event.metadata["slack_ingress_inline_complete"] = True
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"

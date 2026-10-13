@@ -17,7 +17,7 @@ import asyncio
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -83,6 +83,33 @@ def _session_key(chat_id="12345"):
 
 class TestCommandBypassActiveSession:
     """Commands that must bypass the active-session guard."""
+
+    @pytest.mark.asyncio
+    async def test_inline_command_marks_ingress_only_after_delivery(self):
+        adapter = _make_adapter()
+        adapter._active_sessions[_session_key()] = asyncio.Event()
+        event = _make_event("/status")
+        event.metadata["slack_ingress_receipt_ids"] = ["Ev-status"]
+
+        async def send_ok(**kwargs):
+            return SendResult(success=True, message_id="ok")
+        adapter._send_with_retry = send_ok
+        await adapter.handle_message(event)
+        assert event.metadata["slack_ingress_inline_complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_inline_command_delivery_requests_ingress_retry(self):
+        adapter = _make_adapter()
+        adapter._active_sessions[_session_key()] = asyncio.Event()
+        event = _make_event("/status")
+        event.metadata["slack_ingress_receipt_ids"] = ["Ev-status"]
+
+        async def send_failed(**kwargs):
+            return SendResult(success=False, error="unavailable")
+        adapter._send_with_retry = send_failed
+        await adapter.handle_message(event)
+        assert event.metadata["slack_ingress_inline_failed"] is True
+        assert not event.metadata.get("slack_ingress_inline_complete")
 
     @pytest.mark.asyncio
     async def test_stop_bypasses_guard(self):

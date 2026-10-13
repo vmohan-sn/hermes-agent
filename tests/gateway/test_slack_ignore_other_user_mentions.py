@@ -192,6 +192,19 @@ async def test_eligible_handoff_preserves_ingress_receipt(adapter):
 
 
 @pytest.mark.asyncio
+async def test_inline_gateway_consumption_is_finalized_without_agent_task(adapter):
+    adapter.config.extra["require_mention"] = False
+    event = _event("/status", "1700000000.999105")
+    payload = {"event": event, "_slack_ingress_receipt_id": "Ev-inline"}
+    def consumed(message):
+        message.metadata["slack_ingress_inline_complete"] = True
+    adapter.handle_message.side_effect = consumed
+    await _run(adapter, event, payload)
+    assert payload["_slack_ingress_inline_complete"] is True
+    assert not payload.get("_slack_ingress_handed_off")
+
+
+@pytest.mark.asyncio
 async def test_rejected_event_does_not_claim_ts_of_later_eligible_event(adapter):
     """An ignored event must not suppress an eligible representation of a ts."""
     adapter.config.extra["require_mention"] = False

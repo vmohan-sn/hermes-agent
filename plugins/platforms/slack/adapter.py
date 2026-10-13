@@ -4363,7 +4363,11 @@ class SlackAdapter(BasePlatformAdapter):
         if receipt_ids and self._ingress_journal is not None:
             for receipt_id in receipt_ids:
                 try:
-                    if outcome == ProcessingOutcome.SUCCESS:
+                    intentional_cancel = (
+                        outcome == ProcessingOutcome.CANCELLED
+                        and getattr(asyncio.current_task(), "_gateway_user_cancelled", False)
+                    )
+                    if outcome == ProcessingOutcome.SUCCESS or intentional_cancel:
                         await asyncio.to_thread(self._ingress_journal.mark_done, receipt_id)
                     else:
                         await asyncio.to_thread(self._ingress_journal.defer, receipt_id, 5)
@@ -6961,7 +6965,12 @@ class SlackAdapter(BasePlatformAdapter):
                 msg_event.metadata["slack_ingress_receipt_ids"] = [receipt_id]
             await self.handle_message(msg_event)
             if receipt_id:
-                payload["_slack_ingress_handed_off"] = True
+                if msg_event.metadata.get("slack_ingress_inline_failed"):
+                    raise RuntimeError("inline gateway dispatch failed")
+                if msg_event.metadata.get("slack_ingress_inline_complete"):
+                    payload["_slack_ingress_inline_complete"] = True
+                else:
+                    payload["_slack_ingress_handed_off"] = True
         except BaseException:
             if dedup_id:
                 self._dedup.discard(dedup_id)

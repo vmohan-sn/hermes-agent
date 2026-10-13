@@ -5937,6 +5937,10 @@ class BasePlatformAdapter(ABC):
                 session_key,
             )
             self._expected_cancelled_tasks.add(task)
+            # A user-issued /stop, /new, or /reset intentionally abandons
+            # this turn. Distinguish it from shutdown cancellation so a
+            # durable Slack receipt is not replayed against the user's wish.
+            setattr(task, "_gateway_user_cancelled", True)
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
@@ -6031,6 +6035,8 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
+                if (event.metadata or {}).get("slack_ingress_receipt_ids") and not _r.success:
+                    raise RuntimeError("active command response was not delivered")
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -6134,7 +6140,11 @@ class BasePlatformAdapter(ABC):
                     self._discard_text_debounce(session_key)
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
+                        if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                            event.metadata["slack_ingress_inline_complete"] = True
                     except Exception as e:
+                        if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                            event.metadata["slack_ingress_inline_failed"] = True
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
@@ -6159,13 +6169,19 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
+                        if (event.metadata or {}).get("slack_ingress_receipt_ids") and not _r.success:
+                            raise RuntimeError("bypass command response was not delivered")
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                        event.metadata["slack_ingress_inline_complete"] = True
                 except Exception as e:
+                    if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                        event.metadata["slack_ingress_inline_failed"] = True
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
@@ -6212,13 +6228,19 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
+                            if (event.metadata or {}).get("slack_ingress_receipt_ids") and not _r.success:
+                                raise RuntimeError("clarify response was not delivered")
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                            event.metadata["slack_ingress_inline_complete"] = True
                     except Exception as e:
+                        if (event.metadata or {}).get("slack_ingress_receipt_ids"):
+                            event.metadata["slack_ingress_inline_failed"] = True
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,

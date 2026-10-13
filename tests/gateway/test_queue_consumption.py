@@ -219,4 +219,15 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
+    def test_full_queue_reports_rejection_for_durable_ingress_retry(self):
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:fifo"
+        runner._BUSY_QUEUE_MAX_PENDING = 1
+        first = self._text_event("first")
+        second = self._text_event("second")
+        second.metadata["slack_ingress_receipt_ids"] = ["Ev-second"]
+        assert runner._queue_or_replace_pending_event(session_key, first) is True
+        assert runner._queue_or_replace_pending_event(session_key, second) is False
+        assert adapter._pending_messages[session_key] is first
+
 

@@ -247,6 +247,23 @@ async def test_shutdown_cancelled_turn_remains_replayable(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_user_stop_cancelled_turn_does_not_replay(tmp_path):
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")
+    adapter._ingress_journal.put(_payload("Ev-user-stop"))
+    adapter._reactions_enabled = lambda: False
+    event = SimpleNamespace(metadata={"slack_ingress_receipt_ids": ["Ev-user-stop"]}, message_id="123.456")
+    task = asyncio.current_task()
+    task._gateway_user_cancelled = True
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+    finally:
+        del task._gateway_user_cancelled
+    with sqlite3.connect(adapter._ingress_journal.path) as db:
+        assert db.execute("SELECT done_at FROM receipts WHERE event_id='Ev-user-stop'").fetchone()[0] is not None
+
+
+@pytest.mark.asyncio
 async def test_failed_merged_turn_releases_every_receipt_dedup_claim(tmp_path):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
     adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")
@@ -262,6 +279,26 @@ async def test_failed_merged_turn_releases_every_receipt_dedup_claim(tmp_path):
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
     for ts in ("123.001", "123.002"):
         assert adapter._dedup.is_duplicate(adapter._workspace_event_id("T123", ts)) is False
+
+
+@pytest.mark.asyncio
+async def test_inline_gateway_consumer_completes_receipt_without_background_hook(tmp_path):
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._running = True
+    adapter._message_handler = AsyncMock()
+    adapter._ingress_journal = SlackIngressJournal(tmp_path / "ingress.db")
+    adapter._ingress_journal.put(_payload("Ev-inline"))
+
+    async def dispatch(event, payload):
+        payload["_slack_ingress_inline_complete"] = True
+    adapter._handle_slack_message = dispatch
+    task = asyncio.create_task(adapter._drain_slack_ingress())
+    await asyncio.sleep(0.1)
+    adapter._running = False
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    with sqlite3.connect(adapter._ingress_journal.path) as db:
+        assert db.execute("SELECT done_at FROM receipts WHERE event_id='Ev-inline'").fetchone()[0] is not None
 
 
 @pytest.mark.asyncio

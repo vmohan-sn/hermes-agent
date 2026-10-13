@@ -201,6 +201,7 @@ class TestBusySessionAck:
         adapter = _make_adapter()
 
         event = _make_event(text="also check the tests")
+        event.metadata["slack_ingress_receipt_ids"] = ["Ev-steer"]
         sk = build_session_key(event.source)
         runner.adapters[event.source.platform] = adapter
 
@@ -217,6 +218,7 @@ class TestBusySessionAck:
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
         mock_merge.assert_not_called()
+        assert event.metadata["slack_ingress_inline_complete"] is True
 
         # VERIFY: Ack mentions steer wording
         adapter._send_with_retry.assert_called_once()
