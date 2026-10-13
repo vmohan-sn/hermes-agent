@@ -2716,12 +2716,20 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        def _keep_receipts() -> None:
+            # A merged Slack turn represents every inbound receipt, not just
+            # the first message. Completion must finalize all of them.
+            current = (getattr(existing, "metadata", None) or {}).get("slack_ingress_receipt_ids")
+            incoming = (getattr(event, "metadata", None) or {}).get("slack_ingress_receipt_ids")
+            if isinstance(current, list) and isinstance(incoming, list):
+                current.extend(ident for ident in incoming if ident not in current)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            _keep_receipts()
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
@@ -2730,6 +2738,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
+            _keep_receipts()
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2753,6 +2762,7 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            _keep_receipts()
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
@@ -5723,6 +5733,10 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
+            current_receipts = (getattr(state.event, "metadata", None) or {}).get("slack_ingress_receipt_ids")
+            incoming_receipts = (getattr(event, "metadata", None) or {}).get("slack_ingress_receipt_ids")
+            if isinstance(current_receipts, list) and isinstance(incoming_receipts, list):
+                current_receipts.extend(ident for ident in incoming_receipts if ident not in current_receipts)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"

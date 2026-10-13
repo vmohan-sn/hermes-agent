@@ -25,6 +25,12 @@ from gateway.config import Platform, PlatformConfig
 # ---------------------------------------------------------------------------
 
 def _ensure_slack_mock():
+    try:
+        import slack_bolt  # noqa: F401
+        import slack_sdk.socket_mode.response  # noqa: F401
+        return  # A real SDK installation must never be replaced by fake modules.
+    except ImportError:
+        pass
     if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
         return
 
@@ -160,7 +166,7 @@ def _event(text, ts, thread_ts=None):
     return event
 
 
-async def _run(adapter, event):
+async def _run(adapter, event, payload=None):
     with patch.object(
         adapter, "_resolve_user_name", new=AsyncMock(return_value="human")
     ), patch.object(
@@ -170,7 +176,57 @@ async def _run(adapter, event):
     ), patch.object(
         adapter, "_has_active_session_for_thread", return_value=False
     ):
-        await adapter._handle_slack_message(event)
+        await adapter._handle_slack_message(event, payload)
+
+
+@pytest.mark.asyncio
+async def test_eligible_handoff_preserves_ingress_receipt(adapter):
+    adapter.config.extra["require_mention"] = False
+    event = _event("please help", "1700000000.999104")
+    payload = {"event": event, "team_id": "T123", "_slack_ingress_receipt_id": "Ev104"}
+    await _run(adapter, event, payload)
+    adapter.handle_message.assert_awaited_once()
+    accepted = adapter.handle_message.await_args.args[0]
+    assert accepted.metadata["slack_ingress_receipt_ids"] == ["Ev104"]
+    assert payload["_slack_ingress_handed_off"] is True
+
+
+@pytest.mark.asyncio
+async def test_rejected_event_does_not_claim_ts_of_later_eligible_event(adapter):
+    """An ignored event must not suppress an eligible representation of a ts."""
+    adapter.config.extra["require_mention"] = False
+    adapter.config.extra["allowed_channels"] = CHANNEL_ID
+    ts = "1700000000.999101"
+    await _run(adapter, {**_event("not for this bot", ts), "channel": "C_OTHER"})
+    await _run(adapter, _event("please help", ts))
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_pre_handoff_lookup_allows_redelivery(adapter):
+    """A transient lookup failure must not poison dedup for the retry."""
+    adapter.config.extra["require_mention"] = False
+    ts = "1700000000.999102"
+    event = _event("please help", ts)
+    resolver = AsyncMock(side_effect=[TimeoutError("temporary users.info failure"), False, False])
+    with patch.object(adapter, "_resolve_user_is_bot", resolver):
+        with pytest.raises(TimeoutError):
+            await _run(adapter, event)
+        await _run(adapter, event)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_handoff_allows_redelivery_without_duplicate_success(adapter):
+    """Keep the claim only after a successful handoff to the gateway."""
+    adapter.config.extra["require_mention"] = False
+    event = _event("please help", "1700000000.999103")
+    adapter.handle_message.side_effect = [TimeoutError("handoff failed"), None]
+    with pytest.raises(TimeoutError):
+        await _run(adapter, event)
+    await _run(adapter, event)
+    await _run(adapter, event)
+    assert adapter.handle_message.await_count == 2
 
 
 @pytest.mark.asyncio

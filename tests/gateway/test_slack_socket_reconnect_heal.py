@@ -13,6 +13,7 @@ from outliving a teardown.
 """
 
 import asyncio
+import logging
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -295,3 +296,70 @@ class TestSocketModeRestart:
         await adapter._socket_watchdog_loop()
 
         assert reasons == ["transport disconnected"]
+
+    @pytest.mark.asyncio
+    async def test_watchdog_restarts_when_sdk_message_processor_stops_but_socket_is_healthy(self, adapter):
+        """A live WebSocket cannot deliver messages if its queue consumer died."""
+        handler = MagicMock()
+        handler.client.message_processor = asyncio.create_task(asyncio.sleep(0))
+        await handler.client.message_processor
+        adapter._handler = handler
+        adapter._socket_mode_task = MagicMock()
+        adapter._socket_mode_task.done.return_value = False
+        adapter._socket_transport_connected = AsyncMock(return_value=True)
+        adapter._socket_ping_pong_stale = MagicMock(return_value=False)
+        adapter._socket_watchdog_interval_s = 0.01
+
+        reasons: list[str] = []
+
+        async def _fake_restart(reason: str) -> None:
+            reasons.append(reason)
+            adapter._running = False
+
+        adapter._restart_socket_mode = _fake_restart
+        await asyncio.wait_for(adapter._socket_watchdog_loop(), timeout=0.1)
+        assert reasons == ["message processor stopped"]
+
+    @pytest.mark.asyncio
+    async def test_watchdog_restarts_when_sdk_receiver_stops_but_socket_is_healthy(self, adapter):
+        """A healthy heartbeat cannot compensate for a dead frame reader."""
+        handler = MagicMock()
+        handler.client.message_receiver = asyncio.create_task(asyncio.sleep(0))
+        await handler.client.message_receiver
+        adapter._handler = handler
+        adapter._socket_mode_task = MagicMock()
+        adapter._socket_mode_task.done.return_value = False
+        adapter._socket_transport_connected = AsyncMock(return_value=True)
+        adapter._socket_ping_pong_stale = MagicMock(return_value=False)
+        adapter._socket_watchdog_interval_s = 0.01
+        reasons: list[str] = []
+
+        async def _fake_restart(reason: str) -> None:
+            reasons.append(reason)
+            adapter._running = False
+
+        adapter._restart_socket_mode = _fake_restart
+        await asyncio.wait_for(adapter._socket_watchdog_loop(), timeout=0.1)
+        assert reasons == ["message receiver stopped"]
+
+
+@pytest.mark.asyncio
+async def test_slack_ingress_logs_metadata_before_dedup_without_message_text(adapter, caplog):
+    """An event filtered before the agent still leaves a safe receipt marker."""
+    adapter._dedup.is_duplicate = MagicMock(return_value=True)
+    event = {
+        "type": "message",
+        "subtype": "",
+        "user": "U123",
+        "channel": "C123",
+        "ts": "123.456",
+        "thread_ts": "120.000",
+        "text": "private message content",
+    }
+    with caplog.at_level(logging.INFO, logger="plugins.platforms.slack.adapter"):
+        await adapter._handle_slack_message(event)
+
+    receipt = [r.message for r in caplog.records if "[Slack] event received" in r.message]
+    assert len(receipt) == 1
+    assert "channel=C123 ts=123.456 thread_ts=120.000" in receipt[0]
+    assert "private message content" not in receipt[0]

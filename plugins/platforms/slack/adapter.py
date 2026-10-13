@@ -952,6 +952,9 @@ class SlackAdapter(BasePlatformAdapter):
         # user messages without bot_id/subtype=bot_message markers.
         self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
         self._socket_mode_task: Optional[asyncio.Task] = None
+        self._ingress_journal = None
+        self._ingress_worker_task: Optional[asyncio.Task] = None
+        self._ingress_wakeup = asyncio.Event()
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
@@ -1225,6 +1228,49 @@ class SlackAdapter(BasePlatformAdapter):
         self._trim_oldest_dict_entries(self._channel_team, self._CHANNEL_TEAM_MAX)
         self._trim_oldest_dict_entries(self._channel_teams, self._CHANNEL_TEAM_MAX)
 
+    async def _drain_slack_ingress(self) -> None:
+        """Replay every ACKed message until adapter handoff completes."""
+        retry_delay = 0.5
+        while self._running:
+            pending = None
+            try:
+                self._ingress_wakeup.clear()
+                pending = await asyncio.to_thread(self._ingress_journal.next_pending)
+                if pending is None:
+                    try:
+                        await asyncio.wait_for(self._ingress_wakeup.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                event_id, payload = pending
+                # The callback may schedule a background agent task and return
+                # immediately. Keep the receipt until its completion hook, not
+                # merely until the in-memory handoff returns.
+                await asyncio.to_thread(self._ingress_journal.defer, event_id, 3600)
+                payload["_slack_ingress_receipt_id"] = event_id
+                if self._message_handler is None:
+                    raise RuntimeError("gateway message handler is not attached")
+                await self._handle_slack_message(payload["event"], payload)
+                if not payload.get("_slack_ingress_handed_off"):
+                    await asyncio.to_thread(self._ingress_journal.mark_done, event_id)
+                retry_delay = 0.5
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The body is intentionally absent from this log. Never mark
+                # an exception as delivered; replay the same receipt later.
+                logger.exception("[Slack] Durable ingress handoff failed; retrying")
+                if pending is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self._ingress_journal.defer, event_id, retry_delay
+                        )
+                        retry_delay = min(retry_delay * 2, 30)
+                        continue  # A failing thread must not block other threads.
+                    except Exception:
+                        logger.exception("[Slack] Could not defer ingress receipt")
+                await asyncio.sleep(1)
+
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
         if not self._app or not self._app_token:
@@ -1234,6 +1280,27 @@ class SlackAdapter(BasePlatformAdapter):
             self._app, self._app_token, proxy=self._proxy_url
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
+
+        # Bolt auto-ACKs Events API requests before its asynchronous listener
+        # begins. Save message envelopes to a private SQLite inbox first,
+        # then ACK and replay on a separate worker. Other Bolt events retain
+        # their normal listener/ACK behavior.
+        from .ingress import SlackIngressJournal, intercept_message_events, journal_path_for_app
+        from hermes_constants import get_hermes_home
+
+        journal_path = journal_path_for_app(get_hermes_home(), self._app_token)
+        if self._ingress_journal is None or self._ingress_journal.path != journal_path:
+            self._ingress_journal = SlackIngressJournal(journal_path)
+            self._ingress_journal.reset_deferred_on_restart()
+        listeners = self._handler.client.socket_mode_request_listeners
+        if not isinstance(listeners, list) or len(listeners) != 1:
+            # Fail closed if the SDK listener contract changes: falling back
+            # to Bolt here would reintroduce ACK-before-receipt loss.
+            raise RuntimeError("Slack Socket Mode has unexpected request listeners")
+        listeners[0] = intercept_message_events(
+            self._ingress_journal, self._ingress_wakeup, listeners[0]
+        )
+        self._ingress_worker_task = asyncio.create_task(self._drain_slack_ingress())
 
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
@@ -1258,6 +1325,14 @@ class SlackAdapter(BasePlatformAdapter):
         slackapi/python-slack-sdk#1913.
         """
         handler = self._handler
+        ingress_task = self._ingress_worker_task
+        self._ingress_worker_task = None
+        if ingress_task is not None and not ingress_task.done():
+            ingress_task.cancel()
+            try:
+                await ingress_task
+            except asyncio.CancelledError:
+                pass
         task = self._socket_mode_task
         self._handler = None
         self._socket_mode_task = None
@@ -1370,14 +1445,32 @@ class SlackAdapter(BasePlatformAdapter):
                     await self._restart_socket_mode("socket task stopped")
                     continue
 
-                connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
-                    # is_connected() can lie when the aiohttp session is closed
-                    # but the client keeps retrying; ping/pong staleness catches
-                    # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                ingress_task = self._ingress_worker_task
+                if ingress_task is None or ingress_task.done():
+                    logger.warning("[Slack] Durable ingress worker stopped; restarting")
+                    self._ingress_worker_task = asyncio.create_task(self._drain_slack_ingress())
+
+                # The SDK drains WebSocket frames through separate reader and
+                # queue-consumer tasks. Either can stop while the socket and
+                # ping/pong remain healthy, leaving events unprocessed.
+                client = getattr(self._handler, "client", None)
+                for attr, reason in (
+                    ("message_receiver", "message receiver stopped"),
+                    ("message_processor", "message processor stopped"),
+                ):
+                    worker = getattr(client, attr, None)
+                    if isinstance(worker, asyncio.Task) and worker.done():
+                        await self._restart_socket_mode(reason)
+                        break
+                else:
+                    connected = await self._socket_transport_connected()
+                    if connected is False:
+                        await self._restart_socket_mode("transport disconnected")
+                    elif self._socket_ping_pong_stale():
+                        # is_connected() can lie when the aiohttp session is closed
+                        # but the client keeps retrying; ping/pong staleness catches
+                        # that wedged-zombie case that the bool check above misses.
+                        await self._restart_socket_mode("ping/pong stale")
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -4266,6 +4359,22 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        receipt_ids = (event.metadata or {}).get("slack_ingress_receipt_ids") or []
+        if receipt_ids and self._ingress_journal is not None:
+            for receipt_id in receipt_ids:
+                try:
+                    if outcome == ProcessingOutcome.SUCCESS:
+                        await asyncio.to_thread(self._ingress_journal.mark_done, receipt_id)
+                    else:
+                        await asyncio.to_thread(self._ingress_journal.defer, receipt_id, 5)
+                        identity = await asyncio.to_thread(
+                            self._ingress_journal.event_identity, receipt_id
+                        )
+                        if identity and identity[1]:
+                            self._dedup.discard(self._workspace_event_id(*identity))
+                        self._ingress_wakeup.set()
+                except Exception:
+                    logger.exception("[Slack] Failed to finalize durable ingress receipt")
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -5748,28 +5857,21 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
-        # DEBUG entry log — fires BEFORE any filtering so users debugging
-        # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
-        # drops can confirm whether the event actually arrived from Slack
-        # (vs. being silently filtered upstream by the app's event
-        # subscriptions — Socket Mode will not deliver events the app
-        # manifest hasn't subscribed to). See #30091. Metadata only — never
-        # the message text.
-        if logger.isEnabledFor(logging.DEBUG):
-            _bot_profile = event.get("bot_profile") or {}
-            _bot_name = (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or ""
-            logger.debug(
-                "[Slack] event received type=%s subtype=%s user=%s bot_id=%s bot_name=%s "
-                "channel=%s ts=%s thread_ts=%s",
-                event.get("type"),
-                event.get("subtype"),
-                event.get("user", "") or "",
-                event.get("bot_id", "") or "",
-                _bot_name,
-                event.get("channel", ""),
-                event.get("ts", ""),
-                event.get("thread_ts", ""),
-            )
+        # Metadata-only receipt BEFORE filtering. Inbound gateway logs occur
+        # after the SDK, dedup, bot/authorization and channel gates; without
+        # this line a missed turn cannot be located on either side of them.
+        # Never log the event body or message text here.
+        logger.info(
+            "[Slack] event received type=%s subtype=%s user=%s bot_id=%s "
+            "channel=%s ts=%s thread_ts=%s",
+            event.get("type"),
+            event.get("subtype"),
+            event.get("user", "") or "",
+            event.get("bot_id", "") or "",
+            event.get("channel", ""),
+            event.get("ts", ""),
+            event.get("thread_ts", ""),
+        )
         if event.get("subtype") == "message_changed":
             updated_message = event.get("message")
             if not isinstance(updated_message, dict):
@@ -5804,16 +5906,13 @@ class SlackAdapter(BasePlatformAdapter):
                 normalized_event["_slack_changed_event_ts"] = changed_event_ts
             event = normalized_event
 
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
-        # Scope the dedup id by workspace: Slack event ts values are only
-        # unique within one workspace, so two teams' events with the same ts
-        # must not suppress each other.
+        # Compute the workspace-scoped ID now, but only claim it when this
+        # event has passed all eligibility checks and is ready for handoff.
+        # Claiming here poisoned retries after pre-handoff exceptions and let
+        # filtered message/app_mention variants suppress eligible ones.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(
-            self._workspace_event_id(dedup_team_id, event_ts)
-        ):
-            return
+        dedup_id = self._workspace_event_id(dedup_team_id, event_ts) if event_ts else ""
 
         channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
@@ -6851,6 +6950,22 @@ class SlackAdapter(BasePlatformAdapter):
                 f"{msg_event.text}"
             )
 
+        # No await between claim and handoff: concurrent duplicate callbacks
+        # cannot both pass this gate. Release a claim if handoff fails, so a
+        # redelivery can still reach the gateway.
+        if dedup_id and self._dedup.is_duplicate(dedup_id):
+            return
+        try:
+            receipt_id = (payload or {}).get("_slack_ingress_receipt_id")
+            if receipt_id:
+                msg_event.metadata["slack_ingress_receipt_ids"] = [receipt_id]
+            await self.handle_message(msg_event)
+            if receipt_id:
+                payload["_slack_ingress_handed_off"] = True
+        except BaseException:
+            if dedup_id:
+                self._dedup.discard(dedup_id)
+            raise
         if ts:
             self._processed_message_ts[ts] = time.time()
             if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
@@ -6859,8 +6974,6 @@ class SlackAdapter(BasePlatformAdapter):
                     key=lambda item: item[1],
                 )[-self._PROCESSED_MESSAGE_TS_MAX :]
                 self._processed_message_ts = dict(newest_items)
-
-        await self.handle_message(msg_event)
 
     # ----- Approval button support (Block Kit) -----
 

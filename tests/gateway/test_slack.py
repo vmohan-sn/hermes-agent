@@ -237,12 +237,12 @@ class TestBotEventDiagnostics:
         assert os.environ["SLACK_ALLOW_BOTS"] == "all"
 
     @pytest.mark.asyncio
-    async def test_handler_emits_debug_for_bot_event(self, adapter, caplog):
+    async def test_handler_emits_ingress_receipt_for_bot_event(self, adapter, caplog):
         import logging
-        caplog.set_level(logging.DEBUG, logger="plugins.platforms.slack.adapter")
-        # Stub dedup so the debug log is hit even on a bot subtype.
+        caplog.set_level(logging.INFO, logger="plugins.platforms.slack.adapter")
+        # Stub dedup so the receipt is hit even on a bot subtype.
         adapter._dedup = MagicMock()
-        adapter._dedup.is_duplicate.return_value = True  # short-circuit after debug log
+        adapter._dedup.is_duplicate.return_value = True  # short-circuit after receipt
         event = {
             "type": "message",
             "subtype": "bot_message",
@@ -254,14 +254,14 @@ class TestBotEventDiagnostics:
             "thread_ts": "12300.0",
         }
         await adapter._handle_slack_message(event)
-        debug_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        receipt_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert any(
             "event received" in line
             and "bot_id=B_OTHER" in line
             and "user=U_OTHER_BOT" in line
-            and "Liatrio Brain" in line
-            for line in debug_lines
-        ), debug_lines
+            and "Liatrio Brain" not in line
+            for line in receipt_lines
+        ), receipt_lines
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +476,7 @@ class TestAppMentionHandler:
                 self.app_token = app_token
                 self.proxy = proxy
                 self.client = MagicMock(proxy=None)
+                self.client.socket_mode_request_listeners = [AsyncMock()]
                 created_handlers.append(self)
 
             async def start_async(self):
@@ -551,6 +552,7 @@ class TestSlackConnectCleanup:
 
         second_handler = MagicMock()
         second_handler.close_async = AsyncMock(return_value=None)
+        second_handler.client.socket_mode_request_listeners = [AsyncMock()]
         # _start_socket_mode_handler awaits the result of start_async via
         # asyncio.create_task — so the stub must return a real coroutine, not a
         # bare MagicMock.
@@ -653,6 +655,7 @@ class TestSlackSocketWatchdog:
                 self.app_token = app_token
                 self.proxy = proxy
                 self.client = MagicMock()
+                self.client.socket_mode_request_listeners = [AsyncMock()]
                 self.client.proxy = proxy
                 self.client.is_connected = lambda: True
                 self._start_event = asyncio.Event()
@@ -946,6 +949,7 @@ class TestSlackProxyBehavior:
                 self.app_token = app_token
                 self.proxy = proxy
                 self.client = MagicMock(proxy="constructor-default")
+                self.client.socket_mode_request_listeners = [AsyncMock()]
 
             async def start_async(self):
                 return None
